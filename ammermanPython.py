@@ -2,57 +2,77 @@ import serial
 import time
 import json
 import os
+import threading
 
 SERIAL_PORT = '/dev/ttyACM0' 
 CONFIG_FILE = 'winch_config.json'
 
-settings = {"speed": 1000, "unwind": 3000}
+class WinchMaster:
+    def __init__(self):
+        self.settings = self.load_settings()
+        self.current_pos = 0
+        self.current_state = "UNKNOWN"
+        self.running = True
+        try:
+            self.ser = serial.Serial(SERIAL_PORT, 115200, timeout=0.1)
+            time.sleep(2) 
+            threading.Thread(target=self.serial_listener, daemon=True).start()
+        except Exception as e:
+            print(f"Connection Error: {e}"); exit()
 
-def save_settings(data):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(data, f)
+    def load_settings(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        return {"speed": 1000, "unwind": 3000}
 
-def load_settings():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    return settings
-
-try:
-    ser = serial.Serial(SERIAL_PORT, 115200, timeout=1)
-    time.sleep(2) 
-except:
-    print("Error: Could not find Arduino.")
-    exit()
-
-settings = load_settings()
-ser.write(f"{settings['speed']},{settings['unwind']}\n".encode())
-
-print("--- CHAIR CONTROL ---")
-print("Type 'stop' at any time to kill motor power.")
-
-try:
-    while True:
-        print(f"\n[STATUS] Speed: {settings['speed']} | Unwind: {settings['unwind']}")
-        val = input("Enter 'Speed,Steps' (or 'stop'): ").strip().lower()
-        
-        if val == 'stop':
-            ser.write(b"STOP\n")
-            print("!!! KILL COMMAND SENT !!!")
-            continue
-
-        if ',' in val:
+    def serial_listener(self):
+        while self.running:
             try:
-                s, u = val.split(',')
-                settings['speed'] = int(s)
-                settings['unwind'] = int(u)
-                save_settings(settings)
-                ser.write(f"{settings['speed']},{settings['unwind']}\n".encode())
-                print(">> Settings Updated.")
-            except ValueError:
-                print("Invalid format. Use: 1000,3000")
-        else:
-            print("Input not recognized. Use 'speed,steps' or 'stop'.")
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if "POS:" in line and "|STATE:" in line:
+                    parts = line.split("|")
+                    self.current_pos = int(parts[0].split(":")[1])
+                    self.current_state = parts[1].split(":")[1]
+            except: pass
 
-except KeyboardInterrupt:
-    ser.close()
+    def run_calibration(self):
+        print("\n" + "="*45)
+        print("   PRECISION CALIBRATION MODE")
+        print("="*45)
+        print(" a  : FAST Back (-500) | s  : FAST Forward (+500)")
+        print(" aa : SLOW Back (-50)  | ss : SLOW Forward (+50)")
+        print(" r  : Set TOP (Zero)   | d  : Save & Exit")
+        print("-" * 45)
+        self.ser.write(b"CAL\n")
+        
+        while True:
+            cmd = input(f"[Pos: {self.current_pos} | State: {self.current_state}] -> ").strip().lower()
+            if cmd == 'a': self.ser.write(b"MOVE,-500\n")
+            elif cmd == 'aa': self.ser.write(b"MOVE,-50\n")
+            elif cmd == 's': self.ser.write(b"MOVE,500\n")
+            elif cmd == 'ss': self.ser.write(b"MOVE,50\n")
+            elif cmd == 'r':
+                self.ser.write(b"SET_ZERO\n")
+                print(">> Zero Set. Waiting for sync...")
+                time.sleep(0.5)
+            elif cmd == 'd':
+                self.settings['unwind'] = abs(self.current_pos)
+                with open(CONFIG_FILE, 'w') as f: json.dump(self.settings, f)
+                print(f">> SAVED UNWIND: {self.settings['unwind']}")
+                break
+
+    def main_menu(self):
+        while self.running:
+            print(f"\n--- WINCH STATUS: [{self.current_state}] ---")
+            print(f"Target: {self.settings['unwind']} steps | Pos: {self.current_pos}")
+            print("1. Start Auto  | 2. Calibrate | 3. STOP | 4. Exit")
+            choice = input("Select: ")
+            if choice == '1':
+                self.ser.write(f"{self.settings['speed']},{self.settings['unwind']}\n".encode())
+                self.ser.write(b"START\n")
+            elif choice == '2': self.run_calibration()
+            elif choice == '3': self.ser.write(b"STOP\n")
+            elif choice == '4': self.running = False; break
+
+if __name__ == "__main__":
+    WinchMaster().main_menu()
